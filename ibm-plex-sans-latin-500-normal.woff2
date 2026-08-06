@@ -1,0 +1,43 @@
+# Vantage v2.0 — standalone PWA
+
+Installable, offline-capable, device-local planner. No accounts, no runtime CDN calls; data never leaves the device.
+
+## Deploy (GitHub Pages, ~3 minutes)
+
+1. Create a repository (public or private — Pages works from private repos on paid GitHub plans; public repo means the app shell is public, your data is not in it).
+2. Upload the contents of this folder to the repository root.
+3. Repo → Settings → Pages → Source: "Deploy from a branch" → branch `main`, folder `/ (root)` → Save.
+4. Wait ~1 minute; your app is at `https://<user>.github.io/<repo>/`.
+
+Any other static HTTPS host works identically (Cloudflare Pages, your own box behind a cert). HTTPS is mandatory — service workers refuse plain HTTP (localhost excepted).
+
+## Install on iPhone
+
+1. Open the URL in **Safari specifically** — other iOS browsers can't reliably install PWAs.
+2. Share button → **Add to Home Screen** → Add.
+3. Open it once from the home screen while online (lets the service worker finish caching).
+4. From then on it launches fullscreen with no browser UI and works offline.
+
+## Migrate your data from the Claude-hosted version
+
+Published artifact → gear icon → copy Export JSON → open this app → gear → paste into Import → Load. Same schema, no conversion.
+
+## Updating to a new version
+
+Replace the repo files with the new build (each build ships a bumped cache version in `sw.js`). After deploy, close and reopen the app twice — first open fetches the new worker, second open runs it.
+
+## Data & backups
+
+- Storage: browser localStorage on this device only. The app requests persistent storage from iOS; installed PWAs are exempt from Safari's 7-day cleanup, but no mobile OS treats local data as contractual.
+- Discipline: gear → Export periodically, and always before an update or reinstall. Deleting the app from the home screen can delete its data.
+- Bridging devices until phase-2 sync: Export on one, Import on the other. Last import wins — don't run two "source of truth" devices casually.
+
+## Phase 2 (self-hosted sync)
+
+The storage adapter at the top of `src/app.jsx` (`const store = {...}`) is the only seam: swap `localStorage` calls for your sync endpoint and the existing machinery (savedAt stamps, pull-on-focus, dirty-flag, empty-remote guard) does the rest.
+
+## Rebuilding from source
+
+`src/` contains the full source. Rebuild with:
+`npx esbuild src/main.jsx --bundle --minify --format=iife --jsx=automatic --outfile=app.js`
+and `npx tailwindcss@3.4 -c src/tailwind.config.js -i src/tw-input.css -o app.css --minify` (deps: react@18, react-dom@18, lucide-react).

@@ -1,0 +1,955 @@
+import React, { useState, useEffect, useMemo, useRef } from "react";
+import {
+  CalendarDays, ListChecks, Radar, Plus, ChevronLeft, ChevronRight,
+  ChevronDown, ChevronUp, X, Repeat, Link2, Bell, Trash2, Pencil,
+  ArrowUp, ArrowDown, Settings, Flag, CornerDownRight, Circle,
+  CheckCircle2, RotateCcw, RefreshCw
+} from "lucide-react";
+
+/* ============================================================
+   VANTAGE — personal ops planner
+   Sections: Calendar · Task Queue · Horizon (key dates) · Done log
+   Persistence: localStorage (device-local; adapter is the phase-2 sync seam)
+   ============================================================ */
+
+const STORE_KEY = "vantage_data_v1";
+const DEFAULTS = { version: 1, tasks: [], events: [], settings: {} };
+
+/* ---------- storage adapter: device-local. Phase 2 (self-hosted sync)
+   replaces ONLY this object with a remote-backed implementation. ---------- */
+const store = {
+  async get(key) {
+    const value = localStorage.getItem(key);
+    if (value === null) throw new Error("key not found");
+    return { key, value };
+  },
+  async set(key, value) {
+    localStorage.setItem(key, value);
+    return { key, value };
+  },
+};
+
+/* ---------- date utilities (local time, YYYY-MM-DD keys) ---------- */
+const pad = (n) => String(n).padStart(2, "0");
+const toKey = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+const fromKey = (k) => { const [y, m, dd] = k.split("-").map(Number); return new Date(y, m - 1, dd); };
+const todayKey = () => toKey(new Date());
+const addDaysKey = (k, n) => { const d = fromKey(k); d.setDate(d.getDate() + n); return toKey(d); };
+const diffDays = (a, b) => Math.round((fromKey(a) - fromKey(b)) / 86400000); // a - b, days
+const DOW = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+const MONTHS = ["January","February","March","April","May","June","July","August","September","October","November","December"];
+const fmtNice = (k) => { const d = fromKey(k); return `${DOW[(d.getDay() + 6) % 7]} ${d.getDate()} ${MONTHS[d.getMonth()].slice(0, 3)}`; };
+const fmtDM = (k) => { const d = fromKey(k); return `${pad(d.getDate())}/${pad(d.getMonth() + 1)}`; };
+
+function monthGrid(y, m) { // m: 0-11, Monday-start, 42 cells
+  const lead = (new Date(y, m, 1).getDay() + 6) % 7;
+  const start = new Date(y, m, 1 - lead);
+  return Array.from({ length: 42 }, (_, i) => {
+    const d = new Date(start.getFullYear(), start.getMonth(), start.getDate() + i);
+    return { key: toKey(d), inMonth: d.getMonth() === m, dayNum: d.getDate() };
+  });
+}
+
+/* ---------- recurrence ---------- */
+const REC_OPTS = [
+  { v: "none", label: "One-off" }, { v: "daily", label: "Daily" },
+  { v: "weekly", label: "Weekly" }, { v: "fortnightly", label: "Fortnightly" },
+  { v: "monthly", label: "Monthly" }, { v: "yearly", label: "Yearly" },
+];
+
+function occurrences(anchor, rec, aKey, bKey) {
+  const out = [];
+  if (!anchor) return out;
+  rec = rec || "none";
+  if (rec === "none") { if (anchor >= aKey && anchor <= bKey) out.push(anchor); return out; }
+  if (rec === "daily" || rec === "weekly" || rec === "fortnightly") {
+    const step = rec === "daily" ? 1 : rec === "weekly" ? 7 : 14;
+    let cur = anchor;
+    if (cur < aKey) {
+      const gap = diffDays(aKey, anchor);
+      cur = addDaysKey(anchor, Math.floor(gap / step) * step);
+      while (cur < aKey) cur = addDaysKey(cur, step);
+    }
+    while (cur <= bKey) { if (cur >= anchor) out.push(cur); cur = addDaysKey(cur, step); }
+    return out;
+  }
+  const ad = fromKey(anchor); const day = ad.getDate();
+  if (rec === "monthly") {
+    let y = fromKey(aKey).getFullYear(), mo = fromKey(aKey).getMonth();
+    for (let i = 0; i < 15; i++) {
+      const dim = new Date(y, mo + 1, 0).getDate();
+      const k = toKey(new Date(y, mo, Math.min(day, dim)));
+      if (k >= anchor && k >= aKey && k <= bKey) out.push(k);
+      mo++; if (mo > 11) { mo = 0; y++; }
+      if (toKey(new Date(y, mo, 1)) > bKey) break;
+    }
+    return out;
+  }
+  if (rec === "yearly") {
+    for (let y = fromKey(aKey).getFullYear() - 1; y <= fromKey(bKey).getFullYear() + 1; y++) {
+      const dim = new Date(y, ad.getMonth() + 1, 0).getDate();
+      const k = toKey(new Date(y, ad.getMonth(), Math.min(day, dim)));
+      if (k >= anchor && k >= aKey && k <= bKey) out.push(k);
+    }
+    return out;
+  }
+  return out;
+}
+
+function advanceKey(k, rec) {
+  if (rec === "daily") return addDaysKey(k, 1);
+  if (rec === "weekly") return addDaysKey(k, 7);
+  if (rec === "fortnightly") return addDaysKey(k, 14);
+  const d = fromKey(k); const day = d.getDate();
+  if (rec === "monthly") {
+    const t = new Date(d.getFullYear(), d.getMonth() + 1, 1);
+    const dim = new Date(t.getFullYear(), t.getMonth() + 1, 0).getDate();
+    return toKey(new Date(t.getFullYear(), t.getMonth(), Math.min(day, dim)));
+  }
+  if (rec === "yearly") {
+    const dim = new Date(d.getFullYear() + 1, d.getMonth() + 1, 0).getDate();
+    return toKey(new Date(d.getFullYear() + 1, d.getMonth(), Math.min(day, dim)));
+  }
+  return k;
+}
+
+/* ---------- dependency graph ---------- */
+function dependsTransitively(tasks, startId, targetId) {
+  const map = Object.fromEntries(tasks.map((t) => [t.id, t]));
+  const seen = new Set(); const stack = [startId];
+  while (stack.length) {
+    const id = stack.pop();
+    if (id === targetId) return true;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    (map[id]?.dependsOn || []).forEach((d) => stack.push(d));
+  }
+  return false;
+}
+
+const uid = () => (window.crypto?.randomUUID ? window.crypto.randomUUID() : Math.random().toString(36).slice(2) + Date.now().toString(36));
+
+/* ---------- severity / priority tokens ---------- */
+const PRIORITIES = [
+  { v: 0, label: "Critical", pill: "text-red-300 border-red-500/40 bg-red-500/10", dot: "bg-red-400" },
+  { v: 1, label: "High", pill: "text-amber-300 border-amber-500/40 bg-amber-500/10", dot: "bg-amber-400" },
+  { v: 2, label: "Normal", pill: "text-sky-300 border-sky-500/40 bg-sky-500/10", dot: "bg-sky-400" },
+  { v: 3, label: "Low", pill: "text-slate-400 border-slate-600 bg-slate-800/60", dot: "bg-slate-500" },
+];
+const prio = (v) => PRIORITIES[v] ?? PRIORITIES[2];
+
+function deltaInfo(dateKey, todayK) {
+  const dd = diffDays(dateKey, todayK);
+  let label, cls;
+  if (dd < 0) { label = `${-dd}d over`; cls = "text-red-300 border-red-500/50 bg-red-500/15"; }
+  else if (dd === 0) { label = "today"; cls = "text-amber-200 border-amber-500/50 bg-amber-500/15"; }
+  else if (dd <= 2) { label = `in ${dd}d`; cls = "text-amber-300 border-amber-500/40 bg-amber-500/10"; }
+  else { label = `in ${dd}d`; cls = "text-slate-300 border-slate-600 bg-slate-800/70"; }
+  return { dd, label, cls };
+}
+
+const DeltaChip = ({ dateKey, todayK }) => {
+  const d = deltaInfo(dateKey, todayK);
+  return <span className={`fmono text-xs px-2 py-0.5 rounded border shrink-0 ${d.cls}`}>{d.label}</span>;
+};
+
+const REMIND_OPTS = [
+  { v: 0, label: "On the day" }, { v: 1, label: "1 day before" },
+  { v: 2, label: "2 days before" }, { v: 3, label: "3 days before" },
+  { v: 7, label: "1 week before" }, { v: 14, label: "2 weeks before" },
+];
+
+/* ---------- shared style atoms ---------- */
+const inputCls = "w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-100 placeholder-slate-500 focus:outline-none focus:border-sky-500";
+const labelCls = "fmono text-xs uppercase tracking-widest text-slate-500 mb-1 block";
+const Eyebrow = ({ icon: Icon, children }) => (
+  <div className="flex items-center gap-2 mb-3">
+    <Icon size={14} className="text-sky-400" />
+    <span className="fmono text-xs uppercase tracking-widest text-slate-400">{children}</span>
+  </div>
+);
+
+
+/* ---------- modal shell ---------- */
+function Modal({ title, onClose, children, wide }) {
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4" onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}>
+      <div className="absolute inset-0 bg-black/70" />
+      <div className={`relative bg-slate-900 border border-slate-700 rounded-2xl shadow-2xl w-full ${wide ? "max-w-lg" : "max-w-md"} max-h-full overflow-y-auto p-5`}>
+        <div className="flex items-center justify-between mb-4">
+          <h3 className="fdisp text-slate-100 font-semibold">{title}</h3>
+          <button onClick={onClose} className="text-slate-400 hover:text-slate-100 p-1 rounded" aria-label="Close"><X size={18} /></button>
+        </div>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+/* ---------- two-tap destructive button ---------- */
+function ArmedDelete({ onConfirm, label = "Delete", small }) {
+  const [armed, setArmed] = useState(false);
+  useEffect(() => { if (!armed) return; const t = setTimeout(() => setArmed(false), 3000); return () => clearTimeout(t); }, [armed]);
+  return (
+    <button
+      onClick={() => (armed ? (setArmed(false), onConfirm()) : setArmed(true))}
+      className={`inline-flex items-center gap-1 rounded border px-2 ${small ? "py-0.5 text-xs" : "py-1 text-sm"} ${armed ? "border-red-500 text-red-300 bg-red-500/15" : "border-slate-700 text-slate-400 hover:text-red-300 hover:border-red-500/50"}`}
+    >
+      <Trash2 size={small ? 12 : 14} /> {armed ? "Confirm?" : label}
+    </button>
+  );
+}
+
+/* ---------- event editor ---------- */
+function EventEditor({ initial, onSave, onDelete, onClose }) {
+  const [ev, setEv] = useState({
+    title: "", date: todayKey(), start: "", end: "", recurrence: "none",
+    keyDate: false, remindDays: 1, notes: "", ...initial,
+  });
+  const set = (patch) => setEv((p) => ({ ...p, ...patch }));
+  const valid = ev.title.trim() && ev.date;
+  return (
+    <Modal title={initial?.id ? "Edit event" : "New event"} onClose={onClose}>
+      <div className="space-y-4">
+        <div>
+          <label className={labelCls}>Title</label>
+          <input className={inputCls} value={ev.title} onChange={(e) => set({ title: e.target.value })} placeholder="e.g. Change window — edge firewalls" autoFocus />
+        </div>
+        <div className="grid grid-cols-3 gap-3">
+          <div className="col-span-1">
+            <label className={labelCls}>Date</label>
+            <input type="date" className={inputCls} value={ev.date} onChange={(e) => set({ date: e.target.value })} />
+          </div>
+          <div>
+            <label className={labelCls}>Start</label>
+            <input type="time" className={inputCls} value={ev.start} onChange={(e) => set({ start: e.target.value })} />
+          </div>
+          <div>
+            <label className={labelCls}>End</label>
+            <input type="time" className={inputCls} value={ev.end} onChange={(e) => set({ end: e.target.value })} />
+          </div>
+        </div>
+        <div className="grid grid-cols-2 gap-3">
+          <div>
+            <label className={labelCls}>Repeats</label>
+            <select className={inputCls} value={ev.recurrence} onChange={(e) => set({ recurrence: e.target.value })}>
+              {REC_OPTS.map((o) => <option key={o.v} value={o.v}>{o.label}</option>)}
+            </select>
+          </div>
+          <div>
+            <label className={labelCls}>Remind</label>
+            <select className={inputCls} value={ev.remindDays} onChange={(e) => set({ remindDays: Number(e.target.value) })}>
+              {REMIND_OPTS.map((o) => <option key={o.v} value={o.v}>{o.label}</option>)}
+            </select>
+          </div>
+        </div>
+        <button
+          onClick={() => set({ keyDate: !ev.keyDate })}
+          className={`w-full flex items-center gap-2 rounded-lg border px-3 py-2 text-sm ${ev.keyDate ? "border-red-500/50 bg-red-500/10 text-red-300" : "border-slate-700 text-slate-400 hover:border-slate-500"}`}
+        >
+          <Flag size={14} /> {ev.keyDate ? "Flagged as key date — shows on the Horizon" : "Flag as key date (deadline) — shows on the Horizon"}
+        </button>
+        <div>
+          <label className={labelCls}>Detail / notes (shown in reminders)</label>
+          <textarea className={inputCls} rows={3} value={ev.notes} onChange={(e) => set({ notes: e.target.value })} placeholder="Context, links, prep needed…" />
+        </div>
+        {ev.recurrence !== "none" && <p className="text-xs text-slate-500">Recurring series: editing or deleting affects every occurrence.</p>}
+        <div className="flex items-center justify-between pt-1">
+          {initial?.id ? <ArmedDelete onConfirm={() => { onDelete(initial.id); onClose(); }} /> : <span />}
+          <div className="flex gap-2">
+            <button onClick={onClose} className="px-3 py-1.5 text-sm rounded-lg border border-slate-700 text-slate-300 hover:border-slate-500">Cancel</button>
+            <button
+              disabled={!valid}
+              onClick={() => { onSave({ ...ev, title: ev.title.trim() }); onClose(); }}
+              className={`px-4 py-1.5 text-sm rounded-lg font-medium ${valid ? "bg-sky-500 text-slate-950 hover:bg-sky-400" : "bg-slate-800 text-slate-600"}`}
+            >
+              {initial?.id ? "Save changes" : "Add event"}
+            </button>
+          </div>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+/* ---------- settings / data modal ---------- */
+function SettingsModal({ data, onImport, onClearAll, onClose, saveStatus }) {
+  const [importText, setImportText] = useState("");
+  const [msg, setMsg] = useState(null);
+  const exportRef = useRef(null);
+  const json = JSON.stringify(data, null, 2);
+  const copyExport = async () => {
+    try { await navigator.clipboard.writeText(json); setMsg({ ok: true, t: "Copied to clipboard." }); }
+    catch { exportRef.current?.select(); try { document.execCommand("copy"); setMsg({ ok: true, t: "Copied (fallback)." }); } catch { setMsg({ ok: false, t: "Copy blocked — select the text and copy manually." }); } }
+  };
+  const doImport = () => {
+    try {
+      const p = JSON.parse(importText);
+      if (!p || !Array.isArray(p.tasks) || !Array.isArray(p.events)) throw new Error("shape");
+      onImport(p); setMsg({ ok: true, t: "Data loaded and will save automatically." }); setImportText("");
+    } catch { setMsg({ ok: false, t: "That isn't valid Vantage JSON — needs tasks[] and events[]." }); }
+  };
+  return (
+    <Modal title="Data & settings" onClose={onClose} wide>
+      <div className="space-y-5">
+        <p className="text-xs text-slate-400 leading-relaxed">
+          All data lives locally on this device — nothing leaves it. Export regularly as backup, and use export/import to bridge devices until phase-2 sync.
+          Save state: <span className="fmono text-slate-300">{saveStatus}</span>. Export below is your backup path.
+        </p>
+        <div className="fmono text-xs text-slate-500 space-y-0.5">
+          <div>storage: local to this device</div>
+          <div>this device sees: {data.tasks.length} tasks · {data.events.length} events</div>
+          <div>loaded payload from: {data.savedAt ? new Date(data.savedAt).toLocaleString() : "—"}</div>
+          <div>build: v2.0</div>
+        </div>
+        <div>
+          <label className={labelCls}>Export (copy & keep somewhere safe)</label>
+          <textarea ref={exportRef} readOnly rows={5} className={`${inputCls} fmono text-xs`} value={json} onFocus={(e) => e.target.select()} />
+          <button onClick={copyExport} className="mt-2 px-3 py-1.5 text-sm rounded-lg border border-slate-700 text-slate-300 hover:border-sky-500">Copy export</button>
+        </div>
+        <div>
+          <label className={labelCls}>Import (replaces current data)</label>
+          <textarea rows={4} className={`${inputCls} fmono text-xs`} value={importText} onChange={(e) => setImportText(e.target.value)} placeholder="Paste a previous export here…" />
+          <button onClick={doImport} disabled={!importText.trim()} className={`mt-2 px-3 py-1.5 text-sm rounded-lg ${importText.trim() ? "bg-sky-500 text-slate-950 hover:bg-sky-400" : "bg-slate-800 text-slate-600"}`}>Load import</button>
+        </div>
+        {msg && <p className={`text-xs ${msg.ok ? "text-emerald-300" : "text-red-300"}`}>{msg.t}</p>}
+        <div className="border-t border-slate-800 pt-4 flex items-center justify-between">
+          <span className="text-xs text-slate-500">Wipe everything (tasks, events, done log).</span>
+          <ArmedDelete label="Clear all data" onConfirm={() => { onClearAll(); onClose(); }} />
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+/* ---------- task row ---------- */
+function TaskItem({ t, tasks, blockers, expanded, todayK, onExpand, onPatch, onToggleDone, onDelete, onMove }) {
+  const [subTitle, setSubTitle] = useState("");
+  const [depsOpen, setDepsOpen] = useState(false);
+  const p = prio(t.priority);
+  const subs = t.subtasks || [];
+  const subsDone = subs.filter((s) => s.done).length;
+  const openOthers = tasks.filter((x) => !x.done && x.id !== t.id);
+
+  const addSub = () => {
+    const v = subTitle.trim(); if (!v) return;
+    onPatch({ subtasks: [...subs, { id: uid(), title: v, done: false }] });
+    setSubTitle("");
+  };
+  const toggleDep = (id) => {
+    const cur = t.dependsOn || [];
+    onPatch({ dependsOn: cur.includes(id) ? cur.filter((d) => d !== id) : [...cur, id] });
+  };
+
+  return (
+    <div className={`rounded-xl border ${blockers.length ? "border-slate-800 bg-slate-900/40" : "border-slate-800 bg-slate-900/80"}`}>
+      <div className="flex items-start gap-2 p-3">
+        <button onClick={onToggleDone} className="mt-0.5 shrink-0 text-slate-500 hover:text-emerald-300" aria-label="Complete task">
+          {t.done ? <CheckCircle2 size={18} className="text-emerald-400" /> : <Circle size={18} />}
+        </button>
+        <div className="min-w-0 flex-1 cursor-pointer" onClick={onExpand}>
+          <div className={`text-sm font-medium leading-snug ${t.done ? "line-through text-slate-500" : "text-slate-100"} ${blockers.length ? "text-slate-400" : ""}`}>{t.title}</div>
+          <div className="flex flex-wrap items-center gap-1.5 mt-1.5">
+            <span className={`inline-flex items-center gap-1 fmono text-xs px-1.5 py-0.5 rounded border ${p.pill}`}>
+              <span className={`w-1.5 h-1.5 rounded-full ${p.dot}`} /> {p.label}
+            </span>
+            {t.dueDate && <DeltaChip dateKey={t.dueDate} todayK={todayK} />}
+            {t.dueDate && <span className="fmono text-xs text-slate-500">{fmtDM(t.dueDate)}</span>}
+            {t.recurrence && t.recurrence !== "none" && <Repeat size={12} className="text-sky-400" />}
+            {blockers.length > 0 && (
+              <span className="inline-flex items-center gap-1 fmono text-xs px-1.5 py-0.5 rounded border text-red-300 border-red-500/40 bg-red-500/10">
+                <Link2 size={11} /> blocked
+              </span>
+            )}
+            {subs.length > 0 && (
+              <span className="inline-flex items-center gap-1 fmono text-xs text-slate-500"><CornerDownRight size={11} /> {subsDone}/{subs.length}</span>
+            )}
+          </div>
+        </div>
+        <div className="flex flex-col gap-0.5 shrink-0">
+          <button onClick={() => onMove(-1)} className="text-slate-600 hover:text-slate-200 p-0.5" aria-label="Move up"><ArrowUp size={14} /></button>
+          <button onClick={() => onMove(1)} className="text-slate-600 hover:text-slate-200 p-0.5" aria-label="Move down"><ArrowDown size={14} /></button>
+        </div>
+        <button onClick={onExpand} className="shrink-0 text-slate-500 hover:text-slate-200 p-0.5 mt-0.5" aria-label="Expand">
+          {expanded ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
+        </button>
+      </div>
+
+      {expanded && (
+        <div className="border-t border-slate-800 p-3 space-y-4">
+          <div>
+            <label className={labelCls}>Title</label>
+            <input className={inputCls} value={t.title} onChange={(e) => onPatch({ title: e.target.value })} />
+          </div>
+          <div>
+            <label className={labelCls}>Priority</label>
+            <div className="flex flex-wrap gap-1.5">
+              {PRIORITIES.map((pp) => (
+                <button key={pp.v} onClick={() => onPatch({ priority: pp.v })}
+                  className={`fmono text-xs px-2 py-1 rounded border ${t.priority === pp.v ? pp.pill : "border-slate-700 text-slate-500 hover:border-slate-500"}`}>
+                  {pp.label}
+                </button>
+              ))}
+            </div>
+          </div>
+          <div className="grid grid-cols-3 gap-3">
+            <div>
+              <label className={labelCls}>Due</label>
+              <input type="date" className={inputCls} value={t.dueDate || ""} onChange={(e) => onPatch({ dueDate: e.target.value || null })} />
+            </div>
+            <div>
+              <label className={labelCls}>Repeats</label>
+              <select className={inputCls} value={t.recurrence || "none"} onChange={(e) => onPatch({ recurrence: e.target.value })}>
+                {REC_OPTS.map((o) => <option key={o.v} value={o.v}>{o.label}</option>)}
+              </select>
+            </div>
+            <div>
+              <label className={labelCls}>Remind</label>
+              <select className={inputCls} value={t.remindDays ?? 1} onChange={(e) => onPatch({ remindDays: Number(e.target.value) })}>
+                {REMIND_OPTS.map((o) => <option key={o.v} value={o.v}>{o.label}</option>)}
+              </select>
+            </div>
+          </div>
+          {t.recurrence && t.recurrence !== "none" && !t.dueDate && (
+            <p className="text-xs text-amber-300/80">Recurrence needs a due date to know when the next occurrence lands.</p>
+          )}
+          <div>
+            <label className={labelCls}>Detail / notes (shown in reminders)</label>
+            <textarea className={inputCls} rows={2} value={t.notes || ""} onChange={(e) => onPatch({ notes: e.target.value })} placeholder="Context, links, acceptance criteria…" />
+          </div>
+
+          <div>
+            <label className={labelCls}>Subtasks</label>
+            <div className="space-y-1.5">
+              {subs.map((s) => (
+                <div key={s.id} className="flex items-center gap-2">
+                  <button onClick={() => onPatch({ subtasks: subs.map((x) => x.id === s.id ? { ...x, done: !x.done } : x) })} className="text-slate-500 hover:text-emerald-300 shrink-0">
+                    {s.done ? <CheckCircle2 size={15} className="text-emerald-400" /> : <Circle size={15} />}
+                  </button>
+                  <span className={`text-sm flex-1 min-w-0 ${s.done ? "line-through text-slate-500" : "text-slate-200"}`}>{s.title}</span>
+                  <button onClick={() => onPatch({ subtasks: subs.filter((x) => x.id !== s.id) })} className="text-slate-600 hover:text-red-300 shrink-0" aria-label="Remove subtask"><X size={13} /></button>
+                </div>
+              ))}
+              <div className="flex gap-2">
+                <input className={inputCls} value={subTitle} onChange={(e) => setSubTitle(e.target.value)} onKeyDown={(e) => e.key === "Enter" && addSub()} placeholder="Add subtask, press Enter" />
+                <button onClick={addSub} className="px-2.5 rounded-lg border border-slate-700 text-slate-300 hover:border-sky-500" aria-label="Add subtask"><Plus size={15} /></button>
+              </div>
+            </div>
+          </div>
+
+          <div>
+            <div className="flex items-center justify-between">
+              <label className={labelCls}>Dependencies (blocked until these complete)</label>
+              <button onClick={() => setDepsOpen(!depsOpen)} className="fmono text-xs text-sky-400 hover:text-sky-300">{depsOpen ? "close" : "edit"}</button>
+            </div>
+            {blockers.length > 0 && (
+              <div className="flex flex-wrap gap-1.5 mb-1.5">
+                {blockers.map((b) => (
+                  <span key={b.id} className="inline-flex items-center gap-1 fmono text-xs px-1.5 py-0.5 rounded border text-red-300 border-red-500/40 bg-red-500/10"><Link2 size={11} /> {b.title}</span>
+                ))}
+              </div>
+            )}
+            {!blockers.length && !depsOpen && <p className="text-xs text-slate-600">None — this task is unblocked.</p>}
+            {depsOpen && (
+              <div className="space-y-1 mt-1 max-h-40 overflow-y-auto rounded-lg border border-slate-800 p-2">
+                {openOthers.length === 0 && <p className="text-xs text-slate-600">No other open tasks to depend on.</p>}
+                {openOthers.map((o) => {
+                  const checked = (t.dependsOn || []).includes(o.id);
+                  const cycle = !checked && dependsTransitively(tasks, o.id, t.id);
+                  return (
+                    <button key={o.id} disabled={cycle} onClick={() => toggleDep(o.id)}
+                      className={`w-full text-left flex items-center gap-2 text-sm px-2 py-1 rounded ${cycle ? "text-slate-700" : checked ? "text-sky-300 bg-sky-500/10" : "text-slate-300 hover:bg-slate-800"}`}>
+                      {checked ? <CheckCircle2 size={14} /> : <Circle size={14} />}
+                      <span className="flex-1 min-w-0 truncate">{o.title}</span>
+                      {cycle && <span className="fmono text-xs shrink-0">would loop</span>}
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+
+          <div className="flex justify-end pt-1">
+            <ArmedDelete onConfirm={onDelete} label="Delete task" small />
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ============================================================ MAIN ============================================================ */
+export default function VantagePlanner() {
+  const [data, setData] = useState(DEFAULTS);
+  const [loaded, setLoaded] = useState(false);
+  const [saveStatus, setSaveStatus] = useState("saved");
+  const lastSavedAtRef = useRef(0);
+  const dataRef = useRef(DEFAULTS);
+  const statusRef = useRef("saved");
+  const dirtyRef = useRef(false);
+  const [todayK, setTodayK] = useState(todayKey());
+  const [narrow, setNarrow] = useState(false);
+  const [tab, setTab] = useState("calendar");
+  const now = new Date();
+  const [view, setView] = useState({ y: now.getFullYear(), m: now.getMonth() });
+  const [selectedDay, setSelectedDay] = useState(todayKey());
+  const [eventModal, setEventModal] = useState(null);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [expandedTask, setExpandedTask] = useState(null);
+  const [alertsOpen, setAlertsOpen] = useState(true);
+  const [doneOpen, setDoneOpen] = useState(false);
+  const [quickTitle, setQuickTitle] = useState("");
+  const [dayTaskTitle, setDayTaskTitle] = useState("");
+  dataRef.current = data;
+  statusRef.current = saveStatus;
+
+  /* --- responsive + clock --- */
+  useEffect(() => {
+    const m = window.matchMedia("(max-width: 900px)");
+    const f = () => setNarrow(m.matches);
+    f(); m.addEventListener("change", f);
+    const iv = setInterval(() => setTodayK(todayKey()), 60000);
+    return () => { m.removeEventListener("change", f); clearInterval(iv); };
+  }, []);
+
+  /* --- load --- */
+  useEffect(() => {
+    (async () => {
+      let found = false;
+      try {
+        const r = await store.get(STORE_KEY);
+        if (r && r.value) {
+          const p = JSON.parse(r.value);
+          found = true;
+          lastSavedAtRef.current = p.savedAt || 0;
+          setData({ ...DEFAULTS, ...p, settings: { ...DEFAULTS.settings, ...(p.settings || {}) } });
+        }
+      } catch (e) { /* key absent or storage unavailable */ }
+      finally {
+        if (!found) setSaveStatus("loaded empty — press sync if you expected data");
+        setLoaded(true);
+      }
+    })();
+  }, []);
+
+  /* --- debounced save --- */
+  useEffect(() => {
+    if (!loaded) return;
+    if (!dirtyRef.current) return; // never persist an untouched (possibly empty) mount
+    setSaveStatus("saving…");
+    const t = setTimeout(async () => {
+      try {
+        const payload = { ...data, savedAt: Date.now() };
+        await store.set(STORE_KEY, JSON.stringify(payload));
+        lastSavedAtRef.current = payload.savedAt;
+        dirtyRef.current = false;
+        setSaveStatus("saved");
+      } catch (e) { setSaveStatus("not saved — storage error"); }
+    }, 700);
+    return () => clearTimeout(t);
+  }, [data, loaded]);
+
+  /* --- cross-device sync: re-pull on focus, flush on hide --- */
+  const pullFromStorage = async (manual = false) => {
+    if (!manual && statusRef.current.startsWith("saving")) return; // don't clobber mid-edit
+    try {
+      const r = await store.get(STORE_KEY);
+      const p = r && r.value ? JSON.parse(r.value) : null;
+      const remoteEmpty = p && (p.tasks || []).length === 0 && (p.events || []).length === 0;
+      const localHasData = dataRef.current.tasks.length + dataRef.current.events.length > 0;
+      if (remoteEmpty && localHasData) { setSaveStatus("remote empty — kept local data"); return; }
+      if (p && (p.savedAt || 0) > (lastSavedAtRef.current || 0)) {
+        lastSavedAtRef.current = p.savedAt || 0;
+        setData({ ...DEFAULTS, ...p, settings: { ...DEFAULTS.settings, ...(p.settings || {}) } });
+        setSaveStatus("synced — pulled newer data");
+      } else if (manual) {
+        setSaveStatus(p ? "in sync" : "no stored data found");
+      }
+    } catch (e) { if (manual) setSaveStatus("sync failed — storage unavailable"); }
+  };
+  const flushSave = async () => {
+    try {
+      if (!dirtyRef.current) return;
+      const payload = { ...dataRef.current, savedAt: Date.now() };
+      await store.set(STORE_KEY, JSON.stringify(payload));
+      lastSavedAtRef.current = payload.savedAt;
+    } catch (e) { /* best effort */ }
+  };
+  useEffect(() => {
+    if (!loaded) return;
+    const onVis = () => { if (document.visibilityState === "visible") pullFromStorage(false); else flushSave(); };
+    const onFocus = () => pullFromStorage(false);
+    document.addEventListener("visibilitychange", onVis);
+    window.addEventListener("focus", onFocus);
+    return () => { document.removeEventListener("visibilitychange", onVis); window.removeEventListener("focus", onFocus); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loaded]);
+
+  /* --- mutators (all user edits mark the dataset dirty) --- */
+  const mutate = (next) => { dirtyRef.current = true; setData(next); };
+  const patchTask = (id, patch) => mutate((d) => ({ ...d, tasks: d.tasks.map((t) => (t.id === id ? { ...t, ...patch } : t)) }));
+  const deleteTask = (id) => mutate((d) => ({
+    ...d,
+    tasks: d.tasks.filter((t) => t.id !== id).map((t) => ({ ...t, dependsOn: (t.dependsOn || []).filter((x) => x !== id) })),
+  }));
+  const addTask = (title, extra = {}) => {
+    const v = title.trim(); if (!v) return;
+    mutate((d) => {
+      const pv = extra.priority ?? 2;
+      const maxOrder = Math.max(0, ...d.tasks.filter((t) => t.priority === pv).map((t) => t.order || 0));
+      return { ...d, tasks: [...d.tasks, { id: uid(), title: v, priority: pv, order: maxOrder + 1, dueDate: null, recurrence: "none", remindDays: 1, notes: "", subtasks: [], dependsOn: [], done: false, createdAt: todayKey(), ...extra }] };
+    });
+  };
+  const toggleDone = (t) => {
+    if (t.done) { patchTask(t.id, { done: false, doneAt: null }); return; }
+    mutate((d) => {
+      let tasks = d.tasks.map((x) => (x.id === t.id ? { ...x, done: true, doneAt: todayKey() } : x));
+      if (t.recurrence && t.recurrence !== "none" && t.dueDate) {
+        const nextDue = advanceKey(t.dueDate, t.recurrence);
+        tasks = [...tasks, {
+          ...t, id: uid(), done: false, doneAt: null, dueDate: nextDue,
+          subtasks: (t.subtasks || []).map((s) => ({ ...s, id: uid(), done: false })),
+        }];
+      }
+      return { ...d, tasks };
+    });
+  };
+  const moveTask = (id, dir) => mutate((d) => {
+    const t = d.tasks.find((x) => x.id === id); if (!t) return d;
+    const group = d.tasks.filter((x) => !x.done && x.priority === t.priority)
+      .sort((a, b) => (a.order || 0) - (b.order || 0) || (a.createdAt || "").localeCompare(b.createdAt || ""));
+    const i = group.findIndex((x) => x.id === id);
+    const j = i + dir;
+    if (j < 0 || j >= group.length) return d;
+    const ids = group.map((x) => x.id);
+    [ids[i], ids[j]] = [ids[j], ids[i]];
+    const orderOf = Object.fromEntries(ids.map((x, idx) => [x, idx + 1]));
+    return { ...d, tasks: d.tasks.map((x) => (orderOf[x.id] != null ? { ...x, order: orderOf[x.id] } : x)) };
+  });
+  const saveEvent = (ev) => mutate((d) => ev.id
+    ? { ...d, events: d.events.map((e) => (e.id === ev.id ? ev : e)) }
+    : { ...d, events: [...d.events, { ...ev, id: uid() }] });
+  const deleteEvent = (id) => mutate((d) => ({ ...d, events: d.events.filter((e) => e.id !== id) }));
+
+  /* --- derived --- */
+  const cells = useMemo(() => monthGrid(view.y, view.m), [view]);
+  const spanA = cells[0].key, spanB = cells[41].key;
+
+  const eventsByDay = useMemo(() => {
+    const map = {};
+    for (const ev of data.events) {
+      for (const k of occurrences(ev.date, ev.recurrence, spanA, spanB)) {
+        (map[k] = map[k] || []).push(ev);
+      }
+    }
+    for (const k in map) map[k].sort((a, b) => (a.start || "99:99").localeCompare(b.start || "99:99"));
+    return map;
+  }, [data.events, spanA, spanB]);
+
+  const tasksDueByDay = useMemo(() => {
+    const map = {};
+    for (const t of data.tasks) if (!t.done && t.dueDate && t.dueDate >= spanA && t.dueDate <= spanB) (map[t.dueDate] = map[t.dueDate] || []).push(t);
+    return map;
+  }, [data.tasks, spanA, spanB]);
+
+  const blockersById = useMemo(() => {
+    const byId = Object.fromEntries(data.tasks.map((t) => [t.id, t]));
+    const out = {};
+    for (const t of data.tasks) out[t.id] = (t.dependsOn || []).map((id) => byId[id]).filter((d) => d && !d.done);
+    return out;
+  }, [data.tasks]);
+
+  const openTasks = useMemo(
+    () => data.tasks.filter((t) => !t.done).sort((a, b) => a.priority - b.priority || (a.order || 0) - (b.order || 0) || (a.createdAt || "").localeCompare(b.createdAt || "")),
+    [data.tasks]
+  );
+  const doneTasks = useMemo(() => data.tasks.filter((t) => t.done).sort((a, b) => (b.doneAt || "").localeCompare(a.doneAt || "")).slice(0, 30), [data.tasks]);
+
+  const horizonEnd = addDaysKey(todayK, 60);
+  const horizon = useMemo(() => {
+    const rows = [];
+    for (const t of data.tasks) if (!t.done && t.dueDate && t.dueDate <= horizonEnd) rows.push({ kind: "task", id: t.id, dateKey: t.dueDate, title: t.title });
+    for (const ev of data.events) if (ev.keyDate) for (const k of occurrences(ev.date, ev.recurrence, todayK, horizonEnd)) rows.push({ kind: "event", id: ev.id, dateKey: k, title: ev.title });
+    return rows.sort((a, b) => a.dateKey.localeCompare(b.dateKey));
+  }, [data.tasks, data.events, todayK, horizonEnd]);
+
+  const alerts = useMemo(() => {
+    const rows = [];
+    for (const t of data.tasks) {
+      if (t.done || !t.dueDate) continue;
+      if (diffDays(t.dueDate, todayK) <= (t.remindDays ?? 1)) rows.push({ kind: "task", id: t.id, dateKey: t.dueDate, title: t.title, detail: t.notes });
+    }
+    const evEnd = addDaysKey(todayK, 30);
+    for (const ev of data.events) {
+      const occ = occurrences(ev.date, ev.recurrence, todayK, evEnd)[0];
+      if (occ && diffDays(occ, todayK) <= (ev.remindDays ?? 1)) rows.push({ kind: "event", id: ev.id, dateKey: occ, title: ev.title, detail: ev.notes, time: ev.start });
+    }
+    return rows.sort((a, b) => a.dateKey.localeCompare(b.dateKey));
+  }, [data.tasks, data.events, todayK]);
+
+  const jumpToDay = (k) => {
+    const d = fromKey(k);
+    setView({ y: d.getFullYear(), m: d.getMonth() });
+    setSelectedDay(k);
+    if (narrow) setTab("calendar");
+  };
+  const jumpToTask = (id) => { setExpandedTask(id); if (narrow) setTab("tasks"); };
+
+  if (!loaded) {
+    return (
+      <div className="vantage-root min-h-screen bg-slate-950 flex items-center justify-center">
+        <p className="fmono text-sm text-slate-500">Loading your data…</p>
+      </div>
+    );
+  }
+
+  /* ---------- panels ---------- */
+  const CalendarPanel = (
+    <div className="rounded-2xl border border-slate-800 bg-slate-900/60 p-4">
+      <div className="flex items-center justify-between mb-3">
+        <Eyebrow icon={CalendarDays}>Calendar</Eyebrow>
+        <div className="flex items-center gap-1">
+          <button onClick={() => setView((v) => ({ y: v.m === 0 ? v.y - 1 : v.y, m: v.m === 0 ? 11 : v.m - 1 }))} className="p-1.5 rounded-lg text-slate-400 hover:text-slate-100 hover:bg-slate-800" aria-label="Previous month"><ChevronLeft size={16} /></button>
+          <button onClick={() => { const d = new Date(); setView({ y: d.getFullYear(), m: d.getMonth() }); setSelectedDay(todayK); }} className="fmono text-xs px-2 py-1 rounded-lg text-slate-300 hover:bg-slate-800">Today</button>
+          <button onClick={() => setView((v) => ({ y: v.m === 11 ? v.y + 1 : v.y, m: v.m === 11 ? 0 : v.m + 1 }))} className="p-1.5 rounded-lg text-slate-400 hover:text-slate-100 hover:bg-slate-800" aria-label="Next month"><ChevronRight size={16} /></button>
+        </div>
+      </div>
+      <div className="fdisp text-slate-100 font-semibold mb-3">{MONTHS[view.m]} <span className="text-slate-500">{view.y}</span></div>
+      <div className="grid grid-cols-7 gap-1 mb-1">
+        {DOW.map((d) => <div key={d} className="fmono text-xs text-slate-600 text-center">{d.slice(0, narrow ? 1 : 3)}</div>)}
+      </div>
+      <div className="grid grid-cols-7 gap-1">
+        {cells.map((c) => {
+          const evs = eventsByDay[c.key] || [];
+          const due = tasksDueByDay[c.key] || [];
+          const isToday = c.key === todayK;
+          const isSel = c.key === selectedDay;
+          return (
+            <button key={c.key} onClick={() => { setSelectedDay(c.key); if (!c.inMonth) { const d = fromKey(c.key); setView({ y: d.getFullYear(), m: d.getMonth() }); } }}
+              className={`relative rounded-lg border p-1 text-left align-top ${narrow ? "h-12" : "h-20"} overflow-hidden
+                ${isSel ? "border-sky-500 bg-sky-500/10" : isToday ? "border-slate-600 bg-slate-800/60" : "border-slate-800 hover:border-slate-600"}
+                ${c.inMonth ? "" : "opacity-40"}`}>
+              <span className={`fmono text-xs ${isToday ? "text-sky-300 font-semibold" : "text-slate-400"}`}>{c.dayNum}</span>
+              {narrow ? (
+                <div className="flex flex-wrap gap-0.5 mt-0.5">
+                  {evs.slice(0, 3).map((e, i) => <span key={i} className={`w-1.5 h-1.5 rounded-full ${e.keyDate ? "bg-red-400" : "bg-sky-400"}`} />)}
+                  {due.slice(0, 2).map((_, i) => <span key={"t" + i} className="w-1.5 h-1.5 rounded-full bg-amber-400" />)}
+                </div>
+              ) : (
+                <div className="mt-0.5 space-y-0.5">
+                  {evs.slice(0, 2).map((e, i) => (
+                    <div key={i} className={`truncate rounded px-1 text-xs ${e.keyDate ? "bg-red-500/20 text-red-200" : "bg-sky-500/20 text-sky-200"}`}>{e.title}</div>
+                  ))}
+                  {(evs.length > 2 || due.length > 0) && (
+                    <div className="fmono text-xs text-slate-500 truncate">
+                      {evs.length > 2 ? `+${evs.length - 2} ` : ""}{due.length > 0 ? `· ${due.length} due` : ""}
+                    </div>
+                  )}
+                </div>
+              )}
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+
+  const dayEvents = eventsByDay[selectedDay] || data.events
+    .filter((ev) => occurrences(ev.date, ev.recurrence, selectedDay, selectedDay).length > 0)
+    .sort((a, b) => (a.start || "99:99").localeCompare(b.start || "99:99"));
+  const dayTasks = data.tasks.filter((t) => !t.done && t.dueDate === selectedDay);
+
+  const DayPanel = (
+    <div className="rounded-2xl border border-slate-800 bg-slate-900/60 p-4">
+      <div className="flex items-center justify-between mb-3">
+        <div className="fdisp text-slate-100 font-semibold">{fmtNice(selectedDay)}{selectedDay === todayK && <span className="fmono text-xs text-sky-400 ml-2">today</span>}</div>
+        <button onClick={() => setEventModal({ date: selectedDay })} className="inline-flex items-center gap-1 text-sm px-2.5 py-1 rounded-lg bg-sky-500 text-slate-950 font-medium hover:bg-sky-400"><Plus size={14} /> Event</button>
+      </div>
+      {dayEvents.length === 0 && dayTasks.length === 0 && <p className="text-sm text-slate-600">Clear day. Add an event, or set a task due here.</p>}
+      <div className="space-y-2">
+        {dayEvents.map((e) => (
+          <div key={e.id} className="flex items-start gap-2 rounded-lg border border-slate-800 bg-slate-950/60 p-2.5">
+            <span className="fmono text-xs text-slate-400 shrink-0 mt-0.5 w-14">{e.start ? e.start + (e.end ? `–${e.end}` : "") : "all day"}</span>
+            <div className="min-w-0 flex-1">
+              <div className="flex items-center gap-1.5">
+                <span className="text-sm text-slate-100 font-medium truncate">{e.title}</span>
+                {e.recurrence !== "none" && <Repeat size={12} className="text-sky-400 shrink-0" />}
+                {e.keyDate && <Flag size={12} className="text-red-400 shrink-0" />}
+              </div>
+              {e.notes && <p className="text-xs text-slate-400 clamp2 mt-0.5">{e.notes}</p>}
+            </div>
+            <button onClick={() => setEventModal(e)} className="text-slate-500 hover:text-slate-200 shrink-0 p-0.5" aria-label="Edit event"><Pencil size={14} /></button>
+          </div>
+        ))}
+        {dayTasks.map((t) => (
+          <div key={t.id} className="flex items-center gap-2 rounded-lg border border-slate-800 bg-slate-950/60 p-2.5">
+            <button onClick={() => toggleDone(t)} className="text-slate-500 hover:text-emerald-300 shrink-0" aria-label="Complete task"><Circle size={16} /></button>
+            <button onClick={() => jumpToTask(t.id)} className="min-w-0 flex-1 text-left">
+              <span className="text-sm text-slate-200 truncate block">{t.title}</span>
+            </button>
+            <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${prio(t.priority).dot}`} />
+          </div>
+        ))}
+      </div>
+      <div className="flex gap-2 mt-3">
+        <input className={inputCls} value={dayTaskTitle} onChange={(e) => setDayTaskTitle(e.target.value)}
+          onKeyDown={(e) => { if (e.key === "Enter") { addTask(dayTaskTitle, { dueDate: selectedDay }); setDayTaskTitle(""); } }}
+          placeholder={`Task due ${fmtDM(selectedDay)} — press Enter`} />
+      </div>
+    </div>
+  );
+
+  const TasksPanel = (
+    <div className="rounded-2xl border border-slate-800 bg-slate-900/60 p-4">
+      <Eyebrow icon={ListChecks}>Task queue — priority order</Eyebrow>
+      <div className="flex gap-2 mb-3">
+        <input className={inputCls} value={quickTitle} onChange={(e) => setQuickTitle(e.target.value)}
+          onKeyDown={(e) => { if (e.key === "Enter") { addTask(quickTitle); setQuickTitle(""); } }}
+          placeholder="Capture a task, press Enter — details after" />
+        <button onClick={() => { addTask(quickTitle); setQuickTitle(""); }} className="px-3 rounded-lg bg-sky-500 text-slate-950 hover:bg-sky-400" aria-label="Add task"><Plus size={16} /></button>
+      </div>
+      <div className="space-y-2">
+        {openTasks.length === 0 && <p className="text-sm text-slate-600">Queue is clear. Capture the next thing above.</p>}
+        {openTasks.map((t) => (
+          <TaskItem key={t.id} t={t} tasks={data.tasks} blockers={blockersById[t.id] || []} todayK={todayK}
+            expanded={expandedTask === t.id}
+            onExpand={() => setExpandedTask(expandedTask === t.id ? null : t.id)}
+            onPatch={(p) => patchTask(t.id, p)}
+            onToggleDone={() => toggleDone(t)}
+            onDelete={() => { deleteTask(t.id); setExpandedTask(null); }}
+            onMove={(dir) => moveTask(t.id, dir)} />
+        ))}
+      </div>
+      <div className="mt-4 border-t border-slate-800 pt-3">
+        <button onClick={() => setDoneOpen(!doneOpen)} className="flex items-center gap-2 fmono text-xs uppercase tracking-widest text-slate-500 hover:text-slate-300">
+          {doneOpen ? <ChevronUp size={13} /> : <ChevronDown size={13} />} Done log · {doneTasks.length}
+        </button>
+        {doneOpen && (
+          <div className="mt-2 space-y-1.5">
+            {doneTasks.length === 0 && <p className="text-xs text-slate-600">Nothing completed yet.</p>}
+            {doneTasks.map((t) => (
+              <div key={t.id} className="flex items-center gap-2 text-sm">
+                <CheckCircle2 size={14} className="text-emerald-500/70 shrink-0" />
+                <span className="line-through text-slate-500 flex-1 min-w-0 truncate">{t.title}</span>
+                <span className="fmono text-xs text-slate-600 shrink-0">{t.doneAt ? fmtDM(t.doneAt) : ""}</span>
+                <button onClick={() => toggleDone(t)} className="text-slate-600 hover:text-slate-300 shrink-0" aria-label="Restore task"><RotateCcw size={13} /></button>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+
+  const HorizonPanel = (
+    <div className="rounded-2xl border border-slate-800 bg-slate-900/60 p-4">
+      <Eyebrow icon={Radar}>Horizon — key dates, 60 days</Eyebrow>
+      {horizon.length === 0 && <p className="text-sm text-slate-600">Nothing on the horizon. Due-dated tasks and flagged key-date events appear here automatically.</p>}
+      <div className="space-y-1.5">
+        {horizon.slice(0, 15).map((r, i) => (
+          <button key={r.kind + r.id + r.dateKey + i} onClick={() => (r.kind === "task" ? jumpToTask(r.id) : jumpToDay(r.dateKey))}
+            className="w-full flex items-center gap-2 rounded-lg px-2 py-1.5 hover:bg-slate-800/70 text-left">
+            <span className="fmono text-xs text-slate-500 w-14 shrink-0">{fmtDM(r.dateKey)}</span>
+            <DeltaChip dateKey={r.dateKey} todayK={todayK} />
+            {r.kind === "event" ? <Flag size={12} className="text-red-400 shrink-0" /> : <ListChecks size={12} className="text-slate-500 shrink-0" />}
+            <span className="text-sm text-slate-200 truncate">{r.title}</span>
+          </button>
+        ))}
+        {horizon.length > 15 && <p className="fmono text-xs text-slate-600 px-2">+{horizon.length - 15} more within 60 days</p>}
+      </div>
+    </div>
+  );
+
+  const AlertsStrip = alerts.length > 0 && (
+    <div className="rounded-2xl border border-amber-500/30 bg-amber-500/10">
+      <button onClick={() => setAlertsOpen(!alertsOpen)} className="w-full flex items-center gap-2 px-4 py-2.5 text-left">
+        <Bell size={15} className="text-amber-300 shrink-0" />
+        <span className="fmono text-xs uppercase tracking-widest text-amber-200 flex-1">Reminders · {alerts.length}</span>
+        {alertsOpen ? <ChevronUp size={15} className="text-amber-300" /> : <ChevronDown size={15} className="text-amber-300" />}
+      </button>
+      {alertsOpen && (
+        <div className="px-4 pb-3 space-y-2">
+          {alerts.map((a, i) => (
+            <button key={a.kind + a.id + i} onClick={() => (a.kind === "task" ? jumpToTask(a.id) : jumpToDay(a.dateKey))}
+              className="w-full text-left rounded-lg bg-slate-950/50 border border-slate-800 p-2.5 hover:border-amber-500/40">
+              <div className="flex items-center gap-2">
+                <DeltaChip dateKey={a.dateKey} todayK={todayK} />
+                {a.kind === "event" ? <CalendarDays size={13} className="text-sky-400 shrink-0" /> : <ListChecks size={13} className="text-slate-400 shrink-0" />}
+                <span className="text-sm text-slate-100 font-medium truncate">{a.title}</span>
+                {a.time && <span className="fmono text-xs text-slate-500 shrink-0">{a.time}</span>}
+              </div>
+              {a.detail && <p className="text-xs text-slate-400 mt-1 leading-relaxed">{a.detail}</p>}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+
+  const TABS = [
+    { id: "calendar", label: "Calendar", icon: CalendarDays },
+    { id: "tasks", label: "Tasks", icon: ListChecks },
+    { id: "horizon", label: "Horizon", icon: Radar },
+  ];
+
+  return (
+    <div className="vantage-root min-h-screen bg-slate-950 text-slate-100">
+      <div className="max-w-6xl mx-auto p-4 md:p-6 space-y-4">
+        {/* header */}
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <div className="w-7 h-7 rounded-lg border-2 border-sky-400 flex items-center justify-center rotate-45">
+              <div className="w-2 h-2 bg-sky-400 rounded-sm" />
+            </div>
+            <div>
+              <div className="fdisp font-bold text-lg leading-none">Vantage</div>
+              <div className="fmono text-xs text-slate-500 uppercase tracking-widest mt-0.5">ops planner · v2.0</div>
+            </div>
+          </div>
+          <div className="flex items-center gap-3">
+            <span className={`fmono text-xs ${saveStatus.startsWith("saving") ? "text-amber-300" : saveStatus === "saved" || saveStatus.startsWith("synced") || saveStatus === "in sync" ? "text-slate-500" : "text-red-300"}`}>
+              {saveStatus}
+            </span>
+            <button onClick={() => pullFromStorage(true)} className="p-2 rounded-lg text-slate-400 hover:text-slate-100 hover:bg-slate-800" aria-label="Pull latest from storage"><RefreshCw size={16} /></button>
+            <button onClick={() => setSettingsOpen(true)} className="p-2 rounded-lg text-slate-400 hover:text-slate-100 hover:bg-slate-800" aria-label="Data and settings"><Settings size={17} /></button>
+          </div>
+        </div>
+
+        {AlertsStrip}
+
+        {narrow ? (
+          <>
+            <div className="grid grid-cols-3 gap-1.5">
+              {TABS.map((tb) => (
+                <button key={tb.id} onClick={() => setTab(tb.id)}
+                  className={`flex items-center justify-center gap-1.5 rounded-xl border py-2 text-sm ${tab === tb.id ? "border-sky-500 bg-sky-500/10 text-sky-200" : "border-slate-800 text-slate-400"}`}>
+                  <tb.icon size={15} /> {tb.label}
+                </button>
+              ))}
+            </div>
+            {tab === "calendar" && <div className="space-y-4">{CalendarPanel}{DayPanel}</div>}
+            {tab === "tasks" && TasksPanel}
+            {tab === "horizon" && HorizonPanel}
+          </>
+        ) : (
+          <div className="grid grid-cols-12 gap-4 items-start">
+            <div className="col-span-7 space-y-4">{CalendarPanel}{DayPanel}</div>
+            <div className="col-span-5 space-y-4">{HorizonPanel}{TasksPanel}</div>
+          </div>
+        )}
+
+        <p className="fmono text-xs text-slate-700 text-center pt-2">
+          Reminders surface when this app is open — it can't push notifications while closed.
+        </p>
+      </div>
+
+      {eventModal && <EventEditor initial={eventModal} onSave={saveEvent} onDelete={deleteEvent} onClose={() => setEventModal(null)} />}
+      {settingsOpen && (
+        <SettingsModal data={data} saveStatus={saveStatus}
+          onImport={(p) => mutate({ ...DEFAULTS, ...p })}
+          onClearAll={() => mutate(DEFAULTS)}
+          onClose={() => setSettingsOpen(false)} />
+      )}
+    </div>
+  );
+}
