@@ -1,5 +1,5 @@
 // Vantage service worker — the offline engine. Bump CACHE on every deploy.
-const CACHE = "vantage-v2.0.3";
+const CACHE = "vantage-v2.2.0";
 const ASSETS = [
   "./",
   "./index.html",
@@ -46,4 +46,20 @@ self.addEventListener("fetch", (e) => {
           .catch(() => caches.match("./index.html"))
     )
   );
+});
+
+/* ---------- web push ---------- */
+self.addEventListener("push", (e) => {
+  let d = { title: "Vantage", body: "" };
+  try { d = e.data.json(); } catch (err) {}
+  e.waitUntil(self.registration.showNotification(d.title || "Vantage", {
+    body: d.body || "", tag: d.tag || "vantage", icon: "./app-icon-192.png", badge: "./app-icon-192.png",
+  }));
+});
+self.addEventListener("notificationclick", (e) => {
+  e.notification.close();
+  e.waitUntil(clients.matchAll({ type: "window", includeUncontrolled: true }).then((list) => {
+    for (const c of list) if ("focus" in c) return c.focus();
+    return clients.openWindow("./");
+  }));
 });
